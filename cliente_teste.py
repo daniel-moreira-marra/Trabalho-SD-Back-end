@@ -3,11 +3,9 @@ import json
 import time
 
 def enviar_mensagem(source_id, texto, timestamp):
-    # O endereço do Nginx configurado no seu docker-compose
     HOST = '127.0.0.1'
     PORT = 8080
 
-    # Monta o dicionário com a exata estrutura do Rust
     msg_dict = {
         "source_id": source_id,
         "payload": texto,
@@ -27,7 +25,6 @@ def enviar_mensagem(source_id, texto, timestamp):
             print(f"[{source_id}] Enviando: {msg_dict}")
             s.sendall(msg_json.encode('utf-8'))
             
-            # Aguarda a resposta do servidor Rust
             data = s.recv(1024)
             print(f"[{source_id}] Resposta do Servidor: {data.decode('utf-8').strip()}\n")
             

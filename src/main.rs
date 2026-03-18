@@ -1,4 +1,3 @@
-// Inicio Fase 1 Euler
 use serde::{Deserialize, Serialize};
 use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -6,6 +5,7 @@ use tokio::net::{TcpListener, TcpStream};
 use std::env;
 use tokio_util::codec::{Framed, LinesCodec};
 use futures::{StreamExt, SinkExt};
+use tokio::io::AsyncWriteExt;
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 struct Message {
@@ -14,14 +14,16 @@ struct Message {
     timestamp: u64,
     #[serde(default)]
     is_concurrent: bool,
+    #[serde(default)]
+    is_broadcast: bool,
+    #[serde(default)]
+    forwarder_id: Option<String>,
 }
 
 struct LamportClock {
     counter: AtomicU64,
 }
-// Fim Fase 1 Euler
 
-// Inicio Fase 2 Euler
 impl LamportClock {
     fn new(initial: u64) -> Self {
         Self {
@@ -36,7 +38,6 @@ impl LamportClock {
     fn update(&self, received_timestamp: u64) -> u64 {
         let mut current = self.counter.load(Ordering::SeqCst);
         loop {
-            // Regra 2: max(local, received) + 1
             let new_val = std::cmp::max(current, received_timestamp) + 1;
             match self.counter.compare_exchange_weak(
                 current,
@@ -54,9 +55,7 @@ impl LamportClock {
         self.counter.load(Ordering::SeqCst)
     }
 }
-// Fim Fase 2 Euler
 
-// Inicio Fase 1 Euler
 struct BackendNode {
     id: String,
     clock: Arc<LamportClock>,
@@ -72,30 +71,66 @@ impl BackendNode {
         }
     }
 
-// Inicio Fase 3 Euler
     fn process_message(&self, mut msg: Message) -> Message {
-        let local_ts = self.clock.get();
-        
-        // Regra 2: Atualiza o relógio local
-        let new_ts = self.clock.update(msg.timestamp);
-        
+        let local_ts_before = self.clock.get();
+
+        if msg.is_broadcast {
+            self.clock.update(msg.timestamp);
+        } else {
+            let new_ts = self.clock.increment();
+            msg.timestamp = new_ts;
+        }
+
+        let local_ts_after = self.clock.get();
         let mut history = self.history.lock().unwrap();
         
-        // Detecção de Concorrência:
-        // Heurística de Lamport para ordem parcial e detecção básica de concorrência.
         msg.is_concurrent = history.iter().any(|m| m.timestamp == msg.timestamp && m.source_id != msg.source_id);
         
+        let forwarder_info = match &msg.forwarder_id {
+            Some(f_id) => format!(" (via Node {})", f_id),
+            None => "".to_string(),
+        };
+        
         println!(
-            "[Node {}] Received from {}: '{}' (msg_ts: {}, local_ts_before: {}, local_ts_after: {}) {}",
-            self.id, msg.source_id, msg.payload, msg.timestamp, local_ts, new_ts,
+            "[Node {}] Processou de {}{}: '{}' (msg_ts: {}, local_ts_before: {}, local_ts_after: {}) {}",
+            self.id, msg.source_id, forwarder_info, msg.payload, msg.timestamp, local_ts_before, local_ts_after,
             if msg.is_concurrent { "[CONCURRENT]" } else { "" }
         );
 
         history.push(msg.clone());
+        
+        history.sort_by(|a, b| {
+            if a.timestamp == b.timestamp {
+                a.source_id.cmp(&b.source_id)
+            } else {
+                a.timestamp.cmp(&b.timestamp)
+            }
+        });
+        
         msg
     }
 }
-// Fim Fase 3 Euler
+
+async fn broadcast_to_peers(msg: Message, my_node_id: String) {
+    let all_nodes = ["1", "2", "3"];
+    
+    for target_id in all_nodes {
+        if target_id == my_node_id { continue; }
+        
+        let peer_hostname = format!("backend{}:9000", target_id);
+        let mut broadcast_msg = msg.clone();
+        broadcast_msg.is_broadcast = true;
+        broadcast_msg.forwarder_id = Some(my_node_id.clone()); 
+        
+        let msg_str = serde_json::to_string(&broadcast_msg).unwrap() + "\n";
+        
+        tokio::spawn(async move {
+            if let Ok(mut stream) = TcpStream::connect(&peer_hostname).await {
+                let _ = stream.write_all(msg_str.as_bytes()).await;
+            }
+        });
+    }
+}
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -104,48 +139,40 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let addr = format!("0.0.0.0:{}", port);
 
     let node = Arc::new(BackendNode::new(node_id.clone()));
-// Fim Fase 1 Euler
 
-// Inicio Fase 1 Daniel
     let listener = TcpListener::bind(&addr).await?;
     println!("Backend Node {} listening on {}", node_id, addr);
 
     loop {
         let (socket, _) = listener.accept().await?;
         let node = Arc::clone(&node);
+        let current_node_id = node_id.clone();
 
         tokio::spawn(async move {
-            // Inicio Fase 1 Euler: Framing com LinesCodec
             let mut framed = Framed::new(socket, LinesCodec::new());
-            // Fim Fase 1 Euler
 
             while let Some(result) = framed.next().await {
                 match result {
                     Ok(line) => {
                         if let Ok(msg) = serde_json::from_str::<Message>(&line) {
-                            // Fase 3 Euler: Processamento
+                            let is_incoming_broadcast = msg.is_broadcast;
+                            
                             let processed = node.process_message(msg);
                             
-                            // Resposta serializada
+                            if !is_incoming_broadcast {
+                                broadcast_to_peers(processed.clone(), current_node_id.clone()).await;
+                            }
+                            
                             if let Ok(response) = serde_json::to_string(&processed) {
                                 let _ = framed.send(response).await;
                             }
-                        } else if line.trim() == "increment" {
-                            // Fase 2 Euler: Incremento local
-                            let new_ts = node.clock.increment();
-                            println!("[Node {}] Local event. New Clock: {}", node.id, new_ts);
-                            let _ = framed.send(format!("Clock incremented to {}", new_ts)).await;
                         } else {
-                            let _ = framed.send("Invalid JSON or command".to_string()).await;
+                            let _ = framed.send("Invalid JSON\n".to_string()).await;
                         }
                     }
-                    Err(e) => {
-                        eprintln!("failed to read from socket; err = {:?}", e);
-                        return;
-                    }
+                    Err(_) => return,
                 }
             }
         });
     }
 }
-// Fim Fase 1 Daniel
